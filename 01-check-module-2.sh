@@ -923,8 +923,8 @@ print_results() {
     local total
 
     printf '\n%sРезультаты проверки module_2%s\n\n' "$C_BOLD" "$C_RESET"
-    printf '%-3s %-7s %-45s %s\n' "№" "Баллы" "Критерий" "Результат"
-    printf '%-3s %-7s %-45s %s\n' "---" "-------" "---------------------------------------------" "------------------------------"
+    printf '%-3s %-7s %s\n' "№" "Баллы" "Критерий"
+    printf '%-3s %-7s %s\n' "---" "-------" "------------------------------------------------------------"
 
     for number in $(seq 1 13); do
         score="${RESULT_SCORE[$number]:-0}"
@@ -934,14 +934,16 @@ print_results() {
             *) color="$C_RED" ;;
         esac
 
-        printf '%-3s %s%-7s%s %-45s %s\n' \
+        printf '%-3s %s%-7s%s %s\n' \
             "$number" "$color" "$score" "$C_RESET" \
-            "${RESULT_TITLE[$number]:-Не проверено}" \
+            "${RESULT_TITLE[$number]:-Не проверено}"
+        printf '    %-7s %s\n' "Результат:" \
             "${RESULT_DETAIL[$number]:-Нет результата}"
+        printf '\n'
     done
 
-    printf '%-3s %-7s %-45s %s\n' \
-        14 "N/A" "Отчёт по ГОСТ" "Не проверяется скриптом"
+    printf '%-3s %-7s %s\n' 14 "N/A" "Отчёт по ГОСТ"
+    printf '    %-7s %s\n' "Результат:" "Не проверяется скриптом"
 
     total="$((TOTAL_HALF_POINTS / 2))"
     if ((TOTAL_HALF_POINTS % 2)); then
