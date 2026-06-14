@@ -981,6 +981,10 @@ print_results() {
         TABLE_FILE="$table_file" \
             PYTHONUTF8=1 \
             PYTHONIOENCODING=utf-8 \
+            TABLE_C_RESET="$C_RESET" \
+            TABLE_C_RED="$C_RED" \
+            TABLE_C_GREEN="$C_GREEN" \
+            TABLE_C_YELLOW="$C_YELLOW" \
             "$python_bin" - <<'PY'
 import csv
 import os
@@ -993,11 +997,21 @@ widths = [
     for index in range(len(rows[0]))
 ]
 
+colors = {
+    "1": os.environ.get("TABLE_C_GREEN", ""),
+    "0.5": os.environ.get("TABLE_C_YELLOW", ""),
+    "0": os.environ.get("TABLE_C_RED", ""),
+}
+reset = os.environ.get("TABLE_C_RESET", "")
+
 for row_index, row in enumerate(rows):
-    print(" | ".join(
+    cells = [
         value.ljust(widths[index])
         for index, value in enumerate(row)
-    ))
+    ]
+    if row_index > 0 and row[1] in colors and colors[row[1]]:
+        cells[1] = f"{colors[row[1]]}{cells[1]}{reset}"
+    print(" | ".join(cells))
     if row_index == 0:
         print("-+-".join("-" * width for width in widths))
 PY
