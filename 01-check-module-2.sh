@@ -259,6 +259,7 @@ install_dependencies() {
         [expect]=expect
         [curl]=curl
         [host]=bind-utils
+        [column]=util-linux
     )
 
     for command_name in "${!package_for[@]}"; do
@@ -919,31 +920,92 @@ check_13_browser() {
 print_results() {
     local number
     local score
-    local color
     local total
+    local title
+    local detail
+    local title_line
+    local detail_line
+    local -a title_lines
+    local -a detail_lines
+    local line_count
+    local line_index
+    local table_file="$TMP_DIR/results.tsv"
+    local python_bin=""
+
+    wrap_text() {
+        local text="$1"
+        local width="$2"
+
+        printf '%s\n' "$text" |
+            fold -s -w "$width"
+    }
 
     printf '\n%sРезультаты проверки module_2%s\n\n' "$C_BOLD" "$C_RESET"
-    printf '%-3s %-7s %s\n' "№" "Баллы" "Критерий"
-    printf '%-3s %-7s %s\n' "---" "-------" "------------------------------------------------------------"
+    printf '№\tБалл\tКритерий\tРезультат\n' > "$table_file"
 
     for number in $(seq 1 13); do
         score="${RESULT_SCORE[$number]:-0}"
-        case "$score" in
-            1) color="$C_GREEN" ;;
-            0.5) color="$C_YELLOW" ;;
-            *) color="$C_RED" ;;
-        esac
+        title="${RESULT_TITLE[$number]:-Не проверено}"
+        detail="${RESULT_DETAIL[$number]:-Нет результата}"
 
-        printf '%-3s %s%-7s%s %s\n' \
-            "$number" "$color" "$score" "$C_RESET" \
-            "${RESULT_TITLE[$number]:-Не проверено}"
-        printf '    %-7s %s\n' "Результат:" \
-            "${RESULT_DETAIL[$number]:-Нет результата}"
-        printf '\n'
+        mapfile -t title_lines < <(wrap_text "$title" 40)
+        mapfile -t detail_lines < <(wrap_text "$detail" 50)
+        line_count="${#title_lines[@]}"
+        ((${#detail_lines[@]} > line_count)) &&
+            line_count="${#detail_lines[@]}"
+
+        for ((line_index = 0; line_index < line_count; line_index++)); do
+            title_line="${title_lines[$line_index]:-}"
+            detail_line="${detail_lines[$line_index]:-}"
+            if ((line_index == 0)); then
+                printf '%s\t%s\t%s\t%s\n' \
+                    "$number" "$score" "$title_line" "$detail_line" \
+                    >> "$table_file"
+            else
+                printf '\t\t%s\t%s\n' "$title_line" "$detail_line" \
+                    >> "$table_file"
+            fi
+        done
     done
 
-    printf '%-3s %-7s %s\n' 14 "N/A" "Отчёт по ГОСТ"
-    printf '    %-7s %s\n' "Результат:" "Не проверяется скриптом"
+    printf '14\tN/A\tОтчёт по ГОСТ\tНе проверяется скриптом\n' \
+        >> "$table_file"
+
+    if command -v python3 >/dev/null 2>&1; then
+        python_bin=python3
+    elif command -v python >/dev/null 2>&1; then
+        python_bin=python
+    fi
+
+    if [[ -n "$python_bin" ]]; then
+        TABLE_FILE="$table_file" \
+            PYTHONUTF8=1 \
+            PYTHONIOENCODING=utf-8 \
+            "$python_bin" - <<'PY'
+import csv
+import os
+
+with open(os.environ["TABLE_FILE"], encoding="utf-8", newline="") as source:
+    rows = list(csv.reader(source, delimiter="\t"))
+
+widths = [
+    max(len(row[index]) for row in rows)
+    for index in range(len(rows[0]))
+]
+
+for row_index, row in enumerate(rows):
+    print(" | ".join(
+        value.ljust(widths[index])
+        for index, value in enumerate(row)
+    ))
+    if row_index == 0:
+        print("-+-".join("-" * width for width in widths))
+PY
+    elif column --help 2>&1 | grep -q -- '--output-separator'; then
+        column -t -s $'\t' -o ' | ' "$table_file"
+    else
+        column -t -s $'\t' "$table_file"
+    fi
 
     total="$((TOTAL_HALF_POINTS / 2))"
     if ((TOTAL_HALF_POINTS % 2)); then
