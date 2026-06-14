@@ -949,7 +949,7 @@ print_results() {
         detail="${RESULT_DETAIL[$number]:-Нет результата}"
 
         mapfile -t title_lines < <(wrap_text "$title" 40)
-        mapfile -t detail_lines < <(wrap_text "$detail" 50)
+        mapfile -t detail_lines < <(wrap_text "$detail" 85)
         line_count="${#title_lines[@]}"
         ((${#detail_lines[@]} > line_count)) &&
             line_count="${#detail_lines[@]}"
