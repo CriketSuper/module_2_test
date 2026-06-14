@@ -14,7 +14,7 @@ source "$ENV_FILE"
 
 required_variables=(
     HQ_SRV_IP BR_SRV_IP LINUX_SSH_USER LINUX_SSH_PASSWORD LINUX_SSH_PORT
-    ISP_IP ISP_SSH_USER ISP_SSH_PASSWORD ISP_SSH_PORT
+    ISP_IP
     HQ_RTR_SSH_HOST BR_RTR_SSH_HOST ROUTER_SSH_USER ROUTER_SSH_PASSWORD
     ROUTER_SSH_PORT HQ_RTR_WAN_IP BR_RTR_WAN_IP
     HQ_WEB_EXTERNAL_PORT BR_APP_EXTERNAL_PORT
@@ -33,6 +33,15 @@ for variable_name in "${required_variables[@]}"; do
         exit 1
     }
 done
+
+HQ_SSH_HOST="${HQ_SSH_HOST:-$HQ_SRV_IP}"
+HQ_SSH_PORT="${HQ_SSH_PORT:-$LINUX_SSH_PORT}"
+BR_SSH_HOST="${BR_SSH_HOST:-$BR_SRV_IP}"
+BR_SSH_PORT="${BR_SSH_PORT:-$LINUX_SSH_PORT}"
+ISP_SSH_USER="${ISP_SSH_USER:-}"
+ISP_SSH_PASSWORD="${ISP_SSH_PASSWORD:-}"
+ISP_SSH_PORT="${ISP_SSH_PORT:-22}"
+ISP_SSH_ENABLED="${ISP_SSH_ENABLED:-no}"
 
 if [[ -t 1 ]]; then
     C_RESET=$'\033[0m'
@@ -91,6 +100,37 @@ count_matches() {
     grep -Eoc -- "$pattern" <<< "$text" 2>/dev/null || true
 }
 
+web_status_code() {
+    local url="$1"
+    local credentials="${2:-}"
+    local -a auth_args=()
+    local code
+    local status
+
+    if [[ -n "$credentials" ]]; then
+        auth_args=(--user "$credentials")
+    fi
+
+    code="$(
+        curl --silent --show-error \
+            --location \
+            --max-redirs 5 \
+            --connect-timeout 5 \
+            --max-time 20 \
+            --output /dev/null \
+            --write-out '%{http_code}' \
+            "${auth_args[@]}" \
+            "$url" 2>/dev/null
+    )"
+    status=$?
+
+    if ((status == 0)); then
+        printf '%s\n' "${code:-000}"
+    else
+        printf '000\n'
+    fi
+}
+
 remote_script() {
     local host="$1"
     local port="$2"
@@ -138,6 +178,10 @@ remote_script() {
         status=$?
     fi
 
+    if ((status != 0)); then
+        printf '__CHECK_REMOTE_ERROR__ host=%s port=%s status=%s\n' \
+            "$host" "$port" "$status"
+    fi
     printf '%s\n' "$output"
     return "$status"
 }
@@ -145,16 +189,63 @@ remote_script() {
 linux_remote() {
     local host="$1"
     local script="$2"
+    local ssh_host="$host"
+    local ssh_port="$LINUX_SSH_PORT"
+
+    case "$host" in
+        "$HQ_SRV_IP")
+            ssh_host="$HQ_SSH_HOST"
+            ssh_port="$HQ_SSH_PORT"
+            ;;
+        "$BR_SRV_IP")
+            ssh_host="$BR_SSH_HOST"
+            ssh_port="$BR_SSH_PORT"
+            ;;
+    esac
+
     remote_script \
-        "$host" "$LINUX_SSH_PORT" \
+        "$ssh_host" "$ssh_port" \
         "$LINUX_SSH_USER" "$LINUX_SSH_PASSWORD" yes "$script"
 }
 
 isp_remote() {
     local script="$1"
+    [[ "$ISP_SSH_ENABLED" == yes ]] || return 2
+    [[ -n "$ISP_SSH_USER" && -n "$ISP_SSH_PASSWORD" ]] || return 2
     remote_script \
         "$ISP_IP" "$ISP_SSH_PORT" \
         "$ISP_SSH_USER" "$ISP_SSH_PASSWORD" yes "$script"
+}
+
+probe_linux_ssh() {
+    local host="$1"
+    local port="$2"
+
+    SSHPASS="$LINUX_SSH_PASSWORD" sshpass -e ssh \
+        -p "$port" \
+        -o BatchMode=no \
+        -o ConnectTimeout=4 \
+        -o ConnectionAttempts=1 \
+        -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        -o LogLevel=ERROR \
+        "$LINUX_SSH_USER@$host" true >/dev/null 2>&1
+}
+
+select_linux_ssh_paths() {
+    if ! probe_linux_ssh "$HQ_SSH_HOST" "$HQ_SSH_PORT" &&
+        probe_linux_ssh "$HQ_RTR_WAN_IP" "$LINUX_SSH_PORT"; then
+        HQ_SSH_HOST="$HQ_RTR_WAN_IP"
+        HQ_SSH_PORT="$LINUX_SSH_PORT"
+        log "HQ-SRV checker access uses static NAT at $HQ_SSH_HOST:$HQ_SSH_PORT"
+    fi
+
+    if ! probe_linux_ssh "$BR_SSH_HOST" "$BR_SSH_PORT" &&
+        probe_linux_ssh "$BR_RTR_WAN_IP" "$LINUX_SSH_PORT"; then
+        BR_SSH_HOST="$BR_RTR_WAN_IP"
+        BR_SSH_PORT="$LINUX_SSH_PORT"
+        log "BR-SRV checker access uses static NAT at $BR_SSH_HOST:$BR_SSH_PORT"
+    fi
 }
 
 install_dependencies() {
@@ -290,6 +381,7 @@ check_1_samba() {
     local dc_ok=no
     local joined_ok=no
     local local_user_ok=no
+    local remote_error=no
 
     output="$(linux_remote "$BR_SRV_IP" "
 systemctl is-active samba 2>/dev/null || true
@@ -297,18 +389,33 @@ samba-tool domain info 127.0.0.1 2>/dev/null || true
 samba-tool computer show 'HQ-CLI$' 2>/dev/null || true
 " 2>/dev/null)" || true
 
+    contains "$output" "__CHECK_REMOTE_ERROR__" && remote_error=yes
     contains "$output" "active" &&
         contains "${output^^}" "${DOMAIN_FQDN^^}" && dc_ok=yes
     contains "${output^^}" "HQ-CLI" && joined_ok=yes
+
+    if host -t SRV "_ldap._tcp.$DOMAIN_FQDN" "$BR_SRV_IP" >/dev/null 2>&1 &&
+        timeout 3 bash -c "</dev/tcp/$BR_SRV_IP/389" >/dev/null 2>&1; then
+        dc_ok=yes
+    fi
+
+    if [[ -s /etc/sssd/sssd.conf ]] &&
+        grep -Fqi "$DOMAIN_FQDN" /etc/sssd/sssd.conf; then
+        joined_ok=yes
+    fi
+
     if getent passwd "$DOMAIN_USER" >/dev/null 2>&1 ||
         getent passwd "$DOMAIN_USER@$DOMAIN_FQDN" >/dev/null 2>&1; then
         local_user_ok=yes
+        joined_ok=yes
     fi
 
     if [[ "$dc_ok" == yes && "$joined_ok" == yes && "$local_user_ok" == yes ]]; then
         set_result 1 1 "$title" "Samba активна, HQ-CLI и доменный пользователь видны"
     elif [[ "$dc_ok" == yes ]]; then
-        set_result 1 0.5 "$title" "Контроллер работает, но ввод HQ-CLI подтверждён не полностью"
+        set_result 1 0.5 "$title" "Контроллер доступен, но доменный вход на HQ-CLI не подтверждён"
+    elif [[ "$remote_error" == yes ]]; then
+        set_result 1 0 "$title" "BR-SRV недоступен проверяющему по SSH, LDAP/Samba также не отвечает"
     else
         set_result 1 0 "$title" "Работающий Samba DC не обнаружен"
     fi
@@ -320,6 +427,8 @@ check_2_users() {
     local users=0
     local members=0
     local i
+    local candidate
+    local remote_error=no
 
     output="$(linux_remote "$BR_SRV_IP" "
 for i in \$(seq 1 $DOMAIN_USER_COUNT); do
@@ -328,15 +437,35 @@ done
 samba-tool group listmembers '$DOMAIN_GROUP' 2>/dev/null || true
 " 2>/dev/null)" || true
 
+    contains "$output" "__CHECK_REMOTE_ERROR__" && remote_error=yes
     users="$(count_matches "$output" '^USER:[0-9]+$')"
     for ((i = 1; i <= DOMAIN_USER_COUNT; i++)); do
         grep -Fixq "${DOMAIN_USER_PREFIX}${i}" <<< "$output" && members=$((members + 1))
     done
 
+    if ((users == 0)); then
+        members=0
+        for ((i = 1; i <= DOMAIN_USER_COUNT; i++)); do
+            candidate="${DOMAIN_USER_PREFIX}${i}"
+            if ! getent passwd "$candidate" >/dev/null 2>&1; then
+                candidate="${DOMAIN_USER_PREFIX}${i}@$DOMAIN_FQDN"
+                getent passwd "$candidate" >/dev/null 2>&1 || continue
+            fi
+            users=$((users + 1))
+            if id -nG "$candidate" 2>/dev/null |
+                tr ' ' '\n' |
+                grep -Eiq "^${DOMAIN_GROUP}(@${DOMAIN_FQDN})?$"; then
+                members=$((members + 1))
+            fi
+        done
+    fi
+
     if ((users == DOMAIN_USER_COUNT && members == DOMAIN_USER_COUNT)); then
         set_result 2 1 "$title" "$users пользователей, все состоят в $DOMAIN_GROUP"
     elif ((users == DOMAIN_USER_COUNT)); then
         set_result 2 0.5 "$title" "$users пользователей, в группе $members"
+    elif [[ "$remote_error" == yes && "$users" -eq 0 ]]; then
+        set_result 2 0 "$title" "BR-SRV недоступен по SSH, через NSS найдено пользователей: 0"
     else
         set_result 2 0 "$title" "Найдено пользователей: $users из $DOMAIN_USER_COUNT"
     fi
@@ -382,6 +511,7 @@ check_4_raid() {
     local mounted_ok=no
     local fstab_ok=no
     local matched=0
+    local missing=()
 
     output="$(linux_remote "$HQ_SRV_IP" "
 mdadm --detail '$RAID_DEVICE' 2>/dev/null || true
@@ -407,10 +537,18 @@ grep -E '[[:space:]]$RAID_MOUNT[[:space:]]' /etc/fstab 2>/dev/null || true
         [[ "$state" == yes ]] && matched=$((matched + 1))
     done
 
+    [[ "$array_ok" == yes ]] || missing+=("устройство")
+    [[ "$level_ok" == yes ]] || missing+=("уровень RAID")
+    [[ "$members_ok" == yes ]] || missing+=("число дисков")
+    [[ "$partition_ok" == yes ]] || missing+=("раздел")
+    [[ "$filesystem_ok" == yes ]] || missing+=("ext4")
+    [[ "$mounted_ok" == yes ]] || missing+=("монтирование")
+    [[ "$fstab_ok" == yes ]] || missing+=("fstab")
+
     if [[ "$array_ok$level_ok$members_ok$partition_ok$filesystem_ok$mounted_ok$fstab_ok" == yesyesyesyesyesyesyes ]]; then
         set_result 4 1 "$title" "RAID$RAID_LEVEL, $RAID_MEMBER_COUNT диска, ext4 и автомонтирование настроены"
     elif ((matched >= 6)); then
-        set_result 4 0.5 "$title" "Массив существует, одна настройка не соответствует"
+        set_result 4 0.5 "$title" "Не совпадает: ${missing[*]}"
     else
         set_result 4 0 "$title" "Массив $RAID_DEVICE не обнаружен"
     fi
@@ -459,6 +597,9 @@ check_6_ntp() {
     local upstream=no
     local allow=no
     local matched=0
+    local local_output
+    local expected_client_stratum=$((NTP_STRATUM + 1))
+    local remote_error=no
 
     output="$(isp_remote "
 systemctl is-active chronyd 2>/dev/null || true
@@ -466,11 +607,35 @@ cat /etc/chrony.conf 2>/dev/null || true
 chronyc tracking 2>/dev/null || true
 " 2>/dev/null)" || true
 
+    contains "$output" "__CHECK_REMOTE_ERROR__" && remote_error=yes
     contains "$output" "active" && active=yes
     grep -Eq "^[[:space:]]*local[[:space:]]+stratum[[:space:]]+$NTP_STRATUM([[:space:]]|$)" \
         <<< "$output" && stratum=yes
     grep -Eq '^[[:space:]]*(server|pool)[[:space:]]+' <<< "$output" && upstream=yes
     grep -Eq '^[[:space:]]*allow[[:space:]]+' <<< "$output" && allow=yes
+
+    local_output="$(
+        {
+            systemctl is-active chronyd 2>/dev/null || true
+            cat /etc/chrony.conf 2>/dev/null || true
+            chronyc -n sources 2>/dev/null || true
+            chronyc tracking 2>/dev/null || true
+        }
+    )"
+
+    if contains "$local_output" "active" &&
+        grep -Eq "^[[:space:]]*server[[:space:]]+$ISP_IP([[:space:]]|$)" \
+            <<< "$local_output"; then
+        active=yes
+    fi
+    if grep -Eq "^\^\*[[:space:]]+$ISP_IP([[:space:]]|$)" <<< "$local_output"; then
+        upstream=yes
+        allow=yes
+    fi
+    if grep -Eq "Stratum[[:space:]]*:[[:space:]]*$expected_client_stratum([[:space:]]|$)" \
+        <<< "$local_output"; then
+        stratum=yes
+    fi
 
     for state in "$active" "$stratum" "$upstream" "$allow"; do
         [[ "$state" == yes ]] && matched=$((matched + 1))
@@ -480,6 +645,8 @@ chronyc tracking 2>/dev/null || true
         set_result 6 1 "$title" "chronyd активен, stratum $NTP_STRATUM и доступ клиентам настроены"
     elif ((matched >= 3)); then
         set_result 6 0.5 "$title" "chronyd работает, одна настройка отличается"
+    elif [[ "$remote_error" == yes ]]; then
+        set_result 6 0 "$title" "SSH на ISP недоступен и HQ-CLI не синхронизирован с $ISP_IP"
     else
         set_result 6 0 "$title" "chronyd на ISP не работает или недоступен"
     fi
@@ -489,18 +656,22 @@ check_7_ansible() {
     local title="Ansible: четыре управляемых узла"
     local output
     local pong_count
+    local remote_error=no
 
     output="$(linux_remote "$BR_SRV_IP" "
 cd /etc/ansible 2>/dev/null || exit 1
 ansible -m ping all 2>&1
 " 2>/dev/null)" || true
 
+    contains "$output" "__CHECK_REMOTE_ERROR__" && remote_error=yes
     pong_count="$(count_matches "$output" '\"ping\"[[:space:]]*:[[:space:]]*\"pong\"')"
     if ((pong_count >= 4)) &&
         ! grep -Eqi '(FAILED|UNREACHABLE|WARNING)' <<< "$output"; then
         set_result 7 1 "$title" "Все четыре узла ответили pong"
     elif ((pong_count >= 2)); then
         set_result 7 0.5 "$title" "Ответили pong: $pong_count узла"
+    elif [[ "$remote_error" == yes ]]; then
+        set_result 7 0 "$title" "BR-SRV недоступен проверяющему по SSH; ansible ping не выполнен"
     else
         set_result 7 0 "$title" "Ответили pong: $pong_count узлов"
     fi
@@ -518,6 +689,7 @@ check_8_docker() {
     local http_ok=no
     local any_http_ok=no
     local published_port
+    local remote_error=no
 
     output="$(linux_remote "$BR_SRV_IP" "
 docker inspect -f 'APP:{{.State.Running}} {{json .HostConfig.PortBindings}} {{range .Config.Env}}{{println .}}{{end}}' '$APP_CONTAINER' 2>/dev/null || true
@@ -527,6 +699,7 @@ docker exec -e MYSQL_PWD='$APP_DB_PASSWORD' '$DB_CONTAINER' \
     echo DBACCESS:yes
 " 2>/dev/null)" || true
 
+    contains "$output" "__CHECK_REMOTE_ERROR__" && remote_error=yes
     contains "$output" "APP:true" && app_running=yes
     contains "$output" "DB:true" && db_running=yes
     contains "$output" "\"$APP_INTERNAL_PORT/tcp\"" &&
@@ -538,6 +711,11 @@ docker exec -e MYSQL_PWD='$APP_DB_PASSWORD' '$DB_CONTAINER' \
     contains "$output" "DBACCESS:yes" && database_access=yes
     curl -fsS --connect-timeout 5 --max-time 15 \
         "http://$BR_SRV_IP:$APP_PORT/" >/dev/null 2>&1 && http_ok=yes
+    if [[ "$http_ok" == no ]] &&
+        curl -fsS --connect-timeout 5 --max-time 15 \
+            "http://$BR_RTR_WAN_IP:$BR_APP_EXTERNAL_PORT/" >/dev/null 2>&1; then
+        http_ok=yes
+    fi
     published_port="$(
         grep -Eo '"HostPort":"[0-9]+"' <<< "$output" |
             head -n 1 |
@@ -553,6 +731,8 @@ docker exec -e MYSQL_PWD='$APP_DB_PASSWORD' '$DB_CONTAINER' \
         set_result 8 1 "$title" "Приложение и БД работают, опубликован порт $APP_PORT"
     elif [[ "$app_running$db_running$any_mapping$any_http_ok" == yesyesyesyes ]]; then
         set_result 8 0.5 "$title" "Контейнеры работают, но опубликованный порт отличается"
+    elif [[ "$remote_error" == yes && "$http_ok" == yes ]]; then
+        set_result 8 0.5 "$title" "Приложение отвечает, но BR-SRV недоступен по SSH для проверки контейнеров"
     else
         set_result 8 0 "$title" "Работающее контейнерное приложение не обнаружено"
     fi
@@ -601,18 +781,37 @@ check_10_nat() {
     local hq_config="$1"
     local br_config="$2"
     local rules=0
+    local hq_web=no
+    local hq_ssh=no
+    local br_app=no
+    local br_ssh=no
 
     contains "$hq_config" "ip nat source static tcp $HQ_SRV_IP $WEB_PORT $HQ_RTR_WAN_IP $HQ_WEB_EXTERNAL_PORT" &&
-        rules=$((rules + 1))
+        hq_web=yes
     contains "$hq_config" "ip nat source static tcp $HQ_SRV_IP $LINUX_SSH_PORT $HQ_RTR_WAN_IP $LINUX_SSH_PORT" &&
-        rules=$((rules + 1))
+        hq_ssh=yes
     contains "$br_config" "ip nat source static tcp $BR_SRV_IP $APP_PORT $BR_RTR_WAN_IP $BR_APP_EXTERNAL_PORT" &&
-        rules=$((rules + 1))
+        br_app=yes
     contains "$br_config" "ip nat source static tcp $BR_SRV_IP $LINUX_SSH_PORT $BR_RTR_WAN_IP $LINUX_SSH_PORT" &&
-        rules=$((rules + 1))
+        br_ssh=yes
+
+    curl -fsS --connect-timeout 3 --max-time 10 \
+        "http://$HQ_RTR_WAN_IP:$HQ_WEB_EXTERNAL_PORT/" >/dev/null 2>&1 &&
+        hq_web=yes
+    curl -fsS --connect-timeout 3 --max-time 10 \
+        "http://$BR_RTR_WAN_IP:$BR_APP_EXTERNAL_PORT/" >/dev/null 2>&1 &&
+        br_app=yes
+    ssh-keyscan -T 3 -p "$LINUX_SSH_PORT" "$HQ_RTR_WAN_IP" \
+        >/dev/null 2>&1 && hq_ssh=yes
+    ssh-keyscan -T 3 -p "$LINUX_SSH_PORT" "$BR_RTR_WAN_IP" \
+        >/dev/null 2>&1 && br_ssh=yes
+
+    for state in "$hq_web" "$hq_ssh" "$br_app" "$br_ssh"; do
+        [[ "$state" == yes ]] && rules=$((rules + 1))
+    done
 
     if ((rules == 4)); then
-        set_result 10 1 "$title" "Найдены все четыре правила NAT"
+        set_result 10 1 "$title" "Все четыре трансляции подтверждены конфигурацией или подключением"
     elif ((rules == 3)); then
         set_result 10 0.5 "$title" "Не найдено одно правило NAT"
     else
@@ -623,12 +822,12 @@ check_10_nat() {
 check_11_proxy() {
     local title="Nginx reverse proxy на ISP"
     local output
-    local client_output
     local web_code=000
     local docker_code=000
     local active=no
     local config_count=0
     local upstream_count=0
+    local anonymous_web_code=000
 
     output="$(isp_remote "
 systemctl is-active nginx 2>/dev/null || true
@@ -643,20 +842,27 @@ nginx -T 2>&1 || true
     contains "$output" "proxy_pass http://$BR_RTR_WAN_IP:$BR_APP_EXTERNAL_PORT" &&
         upstream_count=$((upstream_count + 1))
 
-    client_output="$(linux_remote "$BR_SRV_IP" "
-echo WEB:\$(curl -sS --connect-timeout 5 --max-time 15 -o /dev/null -w '%{http_code}' -u '$AUTH_USER:$AUTH_PASSWORD' 'http://$WEB_DOMAIN/' 2>/dev/null || true)
-echo DOCKER:\$(curl -sS --connect-timeout 5 --max-time 15 -o /dev/null -w '%{http_code}' 'http://$DOCKER_DOMAIN/' 2>/dev/null || true)
-" 2>/dev/null)" || true
-    web_code="$(awk -F: '/^WEB:/ { print $2; exit }' <<< "$client_output")"
-    docker_code="$(awk -F: '/^DOCKER:/ { print $2; exit }' <<< "$client_output")"
+    anonymous_web_code="$(web_status_code "http://$WEB_DOMAIN/")"
+    web_code="$(
+        web_status_code \
+            "http://$WEB_DOMAIN/" \
+            "$AUTH_USER:$AUTH_PASSWORD"
+    )"
+    docker_code="$(web_status_code "http://$DOCKER_DOMAIN/")"
+    anonymous_web_code="${anonymous_web_code:-000}"
     web_code="${web_code:-000}"
     docker_code="${docker_code:-000}"
 
-    if [[ "$active" == yes && "$config_count" -eq 2 && "$upstream_count" -eq 2 &&
+    if [[ "$web_code" =~ ^(2|3)[0-9][0-9]$ &&
+        "$docker_code" =~ ^(2|3)[0-9][0-9]$ &&
+        "$anonymous_web_code" == 401 ]]; then
+        set_result 11 1 "$title" "Оба домена успешно проксируются через ISP"
+    elif [[ "$active" == yes && "$config_count" -eq 2 && "$upstream_count" -eq 2 &&
         "$web_code" =~ ^(2|3)[0-9][0-9]$ &&
         "$docker_code" =~ ^(2|3)[0-9][0-9]$ ]]; then
         set_result 11 1 "$title" "Оба домена успешно проксируются"
-    elif [[ "$active" == yes && "$config_count" -gt 0 ]]; then
+    elif [[ "$active" == yes && "$config_count" -gt 0 ]] ||
+        [[ "$web_code" =~ ^(2|3)[0-9][0-9]$ || "$docker_code" =~ ^(2|3)[0-9][0-9]$ ]]; then
         set_result 11 0.5 "$title" "Nginx настроен, но один из маршрутов не работает"
     else
         set_result 11 0 "$title" "Работающий reverse proxy не обнаружен"
@@ -669,11 +875,12 @@ check_12_auth() {
     local authenticated_code
     local password_ok=no
 
-    anonymous_code="$(curl -sS --connect-timeout 5 --max-time 15 \
-        -o /dev/null -w '%{http_code}' "http://$WEB_DOMAIN/" 2>/dev/null || true)"
-    authenticated_code="$(curl -sS --connect-timeout 5 --max-time 15 \
-        -o /dev/null -w '%{http_code}' \
-        -u "$AUTH_USER:$AUTH_PASSWORD" "http://$WEB_DOMAIN/" 2>/dev/null || true)"
+    anonymous_code="$(web_status_code "http://$WEB_DOMAIN/")"
+    authenticated_code="$(
+        web_status_code \
+            "http://$WEB_DOMAIN/" \
+            "$AUTH_USER:$AUTH_PASSWORD"
+    )"
     anonymous_code="${anonymous_code:-000}"
     authenticated_code="${authenticated_code:-000}"
 
@@ -681,6 +888,11 @@ check_12_auth() {
 command -v htpasswd >/dev/null 2>&1 &&
 htpasswd -vb /etc/nginx/.htpasswd '$AUTH_USER' '$AUTH_PASSWORD'
 " >/dev/null 2>&1 && password_ok=yes
+
+    if [[ "$anonymous_code" == 401 &&
+        "$authenticated_code" =~ ^(2|3)[0-9][0-9]$ ]]; then
+        password_ok=yes
+    fi
 
     if [[ "$anonymous_code" == 401 &&
         "$authenticated_code" =~ ^(2|3)[0-9][0-9]$ &&
@@ -757,6 +969,7 @@ main() {
 
     [[ $EUID -eq 0 ]] || warn "Запуск не от root ограничит установку пакетов и проверку sudo"
     install_dependencies || warn "Some checks may be unavailable"
+    select_linux_ssh_paths
     create_router_expect
 
     log "1/13 Samba DC"
