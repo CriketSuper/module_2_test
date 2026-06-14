@@ -825,10 +825,9 @@ check_11_proxy() {
     local output
     local web_code=000
     local docker_code=000
+    local scheme=https
     local active=no
     local config_count=0
-    local upstream_count=0
-    local anonymous_web_code=000
 
     output="$(isp_remote "
 systemctl is-active nginx 2>/dev/null || true
@@ -838,35 +837,42 @@ nginx -T 2>&1 || true
     contains "$output" "active" && active=yes
     contains "$output" "server_name $WEB_DOMAIN" && config_count=$((config_count + 1))
     contains "$output" "server_name $DOCKER_DOMAIN" && config_count=$((config_count + 1))
-    contains "$output" "proxy_pass http://$HQ_RTR_WAN_IP:$HQ_WEB_EXTERNAL_PORT" &&
-        upstream_count=$((upstream_count + 1))
-    contains "$output" "proxy_pass http://$BR_RTR_WAN_IP:$BR_APP_EXTERNAL_PORT" &&
-        upstream_count=$((upstream_count + 1))
 
-    anonymous_web_code="$(web_status_code "http://$WEB_DOMAIN/")"
     web_code="$(
         web_status_code \
-            "http://$WEB_DOMAIN/" \
+            "https://$WEB_DOMAIN/" \
             "$AUTH_USER:$AUTH_PASSWORD"
     )"
-    docker_code="$(web_status_code "http://$DOCKER_DOMAIN/")"
-    anonymous_web_code="${anonymous_web_code:-000}"
+    docker_code="$(web_status_code "https://$DOCKER_DOMAIN/")"
     web_code="${web_code:-000}"
     docker_code="${docker_code:-000}"
 
+    if [[ "$web_code" == 000 && "$docker_code" == 000 ]]; then
+        scheme=http
+        web_code="$(
+            web_status_code \
+                "http://$WEB_DOMAIN/" \
+                "$AUTH_USER:$AUTH_PASSWORD"
+        )"
+        docker_code="$(web_status_code "http://$DOCKER_DOMAIN/")"
+        web_code="${web_code:-000}"
+        docker_code="${docker_code:-000}"
+    fi
+
     if [[ "$web_code" =~ ^(2|3)[0-9][0-9]$ &&
-        "$docker_code" =~ ^(2|3)[0-9][0-9]$ &&
-        "$anonymous_web_code" == 401 ]]; then
-        set_result 11 1 "$title" "Оба домена успешно проксируются через ISP"
-    elif [[ "$active" == yes && "$config_count" -eq 2 && "$upstream_count" -eq 2 &&
-        "$web_code" =~ ^(2|3)[0-9][0-9]$ &&
         "$docker_code" =~ ^(2|3)[0-9][0-9]$ ]]; then
-        set_result 11 1 "$title" "Оба домена успешно проксируются"
-    elif [[ "$active" == yes && "$config_count" -gt 0 ]] ||
-        [[ "$web_code" =~ ^(2|3)[0-9][0-9]$ || "$docker_code" =~ ^(2|3)[0-9][0-9]$ ]]; then
-        set_result 11 0.5 "$title" "Nginx настроен, но один из маршрутов не работает"
+        set_result 11 1 "$title" \
+            "Оба домена работают по $scheme: web=$web_code, docker=$docker_code"
+    elif [[ "$web_code" =~ ^(2|3)[0-9][0-9]$ ||
+        "$docker_code" =~ ^(2|3)[0-9][0-9]$ ]]; then
+        set_result 11 0.5 "$title" \
+            "$scheme: web=$web_code, docker=$docker_code"
+    elif [[ "$active" == yes && "$config_count" -gt 0 ]]; then
+        set_result 11 0.5 "$title" \
+            "Nginx настроен; с HQ-CLI получено: web=$web_code, docker=$docker_code"
     else
-        set_result 11 0 "$title" "Работающий reverse proxy не обнаружен"
+        set_result 11 0 "$title" \
+            "Reverse proxy недоступен: web=$web_code, docker=$docker_code"
     fi
 }
 
@@ -874,16 +880,29 @@ check_12_auth() {
     local title="Web-based аутентификация"
     local anonymous_code
     local authenticated_code
+    local scheme=https
     local password_ok=no
 
-    anonymous_code="$(web_status_code "http://$WEB_DOMAIN/")"
+    anonymous_code="$(web_status_code "https://$WEB_DOMAIN/")"
     authenticated_code="$(
         web_status_code \
-            "http://$WEB_DOMAIN/" \
+            "https://$WEB_DOMAIN/" \
             "$AUTH_USER:$AUTH_PASSWORD"
     )"
     anonymous_code="${anonymous_code:-000}"
     authenticated_code="${authenticated_code:-000}"
+
+    if [[ "$anonymous_code" == 000 && "$authenticated_code" == 000 ]]; then
+        scheme=http
+        anonymous_code="$(web_status_code "http://$WEB_DOMAIN/")"
+        authenticated_code="$(
+            web_status_code \
+                "http://$WEB_DOMAIN/" \
+                "$AUTH_USER:$AUTH_PASSWORD"
+        )"
+        anonymous_code="${anonymous_code:-000}"
+        authenticated_code="${authenticated_code:-000}"
+    fi
 
     isp_remote "
 command -v htpasswd >/dev/null 2>&1 &&
@@ -898,9 +917,11 @@ htpasswd -vb /etc/nginx/.htpasswd '$AUTH_USER' '$AUTH_PASSWORD'
     if [[ "$anonymous_code" == 401 &&
         "$authenticated_code" =~ ^(2|3)[0-9][0-9]$ &&
         "$password_ok" == yes ]]; then
-        set_result 12 1 "$title" "Без пароля 401, корректные данные предоставляют доступ"
+        set_result 12 1 "$title" \
+            "$scheme: без пароля 401, с паролем $authenticated_code"
     else
-        set_result 12 0 "$title" "Требуемая Basic Auth не подтверждена"
+        set_result 12 0 "$title" \
+            "$scheme: без пароля $anonymous_code, с паролем $authenticated_code"
     fi
 }
 
