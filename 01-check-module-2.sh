@@ -60,7 +60,7 @@ else
 fi
 
 declare -A RESULT_SCORE RESULT_TITLE RESULT_DETAIL
-TOTAL_HALF_POINTS=0
+TOTAL_POINTS=0
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf -- "$TMP_DIR"' EXIT
 
@@ -83,8 +83,8 @@ set_result() {
     RESULT_DETAIL["$number"]="$detail"
 
     case "$score" in
-        1) TOTAL_HALF_POINTS=$((TOTAL_HALF_POINTS + 2)) ;;
-        0.5) TOTAL_HALF_POINTS=$((TOTAL_HALF_POINTS + 1)) ;;
+        2) TOTAL_POINTS=$((TOTAL_POINTS + 2)) ;;
+        1) TOTAL_POINTS=$((TOTAL_POINTS + 1)) ;;
     esac
 }
 
@@ -412,9 +412,9 @@ samba-tool computer show 'HQ-CLI$' 2>/dev/null || true
     fi
 
     if [[ "$dc_ok" == yes && "$joined_ok" == yes && "$local_user_ok" == yes ]]; then
-        set_result 1 1 "$title" "Samba активна, HQ-CLI и доменный пользователь видны"
+        set_result 1 2 "$title" "Samba активна, HQ-CLI и доменный пользователь видны"
     elif [[ "$dc_ok" == yes ]]; then
-        set_result 1 0.5 "$title" "Контроллер доступен, но доменный вход на HQ-CLI не подтверждён"
+        set_result 1 1 "$title" "Контроллер доступен, но доменный вход на HQ-CLI не подтверждён"
     elif [[ "$remote_error" == yes ]]; then
         set_result 1 0 "$title" "BR-SRV недоступен проверяющему по SSH, LDAP/Samba также не отвечает"
     else
@@ -462,9 +462,9 @@ samba-tool group listmembers '$DOMAIN_GROUP' 2>/dev/null || true
     fi
 
     if ((users == DOMAIN_USER_COUNT && members == DOMAIN_USER_COUNT)); then
-        set_result 2 1 "$title" "$users пользователей, все состоят в $DOMAIN_GROUP"
+        set_result 2 2 "$title" "$users пользователей, все состоят в $DOMAIN_GROUP"
     elif ((users == DOMAIN_USER_COUNT)); then
-        set_result 2 0.5 "$title" "$users пользователей, в группе $members"
+        set_result 2 1 "$title" "$users пользователей, в группе $members"
     elif [[ "$remote_error" == yes && "$users" -eq 0 ]]; then
         set_result 2 0 "$title" "BR-SRV недоступен по SSH, через NSS найдено пользователей: 0"
     else
@@ -493,9 +493,9 @@ check_3_sudo() {
 
     if ((command_count == 3)) && [[ "$unrestricted" == no ]] &&
         grep -Eq 'NOPASSWD:.*(cat|HQ_LIMITED)' <<< "$policy"; then
-        set_result 3 1 "$title" "cat, grep и id разрешены без пароля; полный sudo отсутствует"
+        set_result 3 2 "$title" "cat, grep и id разрешены без пароля; полный sudo отсутствует"
     elif ((command_count > 0)); then
-        set_result 3 0.5 "$title" "Ограничение найдено, но соответствует не полностью"
+        set_result 3 1 "$title" "Ограничение найдено, но соответствует не полностью"
     else
         set_result 3 0 "$title" "Правило ограниченного sudo не найдено"
     fi
@@ -547,9 +547,9 @@ grep -E '[[:space:]]$RAID_MOUNT[[:space:]]' /etc/fstab 2>/dev/null || true
     [[ "$fstab_ok" == yes ]] || missing+=("fstab")
 
     if [[ "$array_ok$level_ok$members_ok$partition_ok$filesystem_ok$mounted_ok$fstab_ok" == yesyesyesyesyesyesyes ]]; then
-        set_result 4 1 "$title" "RAID$RAID_LEVEL, $RAID_MEMBER_COUNT диска, ext4 и автомонтирование настроены"
+        set_result 4 2 "$title" "RAID$RAID_LEVEL, $RAID_MEMBER_COUNT диска, ext4 и автомонтирование настроены"
     elif ((matched >= 6)); then
-        set_result 4 0.5 "$title" "Не совпадает: ${missing[*]}"
+        set_result 4 1 "$title" "Не совпадает: ${missing[*]}"
     else
         set_result 4 0 "$title" "Массив $RAID_DEVICE не обнаружен"
     fi
@@ -582,9 +582,9 @@ exportfs -v 2>/dev/null || true
         /etc/fstab 2>/dev/null && fstab_ok=yes
 
     if [[ "$service_ok$export_ok$mounted_ok$source_ok$fstab_ok" == yesyesyesyesyes ]]; then
-        set_result 5 1 "$title" "Экспорт и автомонтирование соответствуют заданию"
+        set_result 5 2 "$title" "Экспорт и автомонтирование соответствуют заданию"
     elif [[ "$service_ok" == yes && "$mounted_ok" == yes ]]; then
-        set_result 5 0.5 "$title" "NFS работает и смонтирован, но параметры отличаются"
+        set_result 5 1 "$title" "NFS работает и смонтирован, но параметры отличаются"
     else
         set_result 5 0 "$title" "Работающая связка NFS не обнаружена"
     fi
@@ -643,9 +643,9 @@ chronyc tracking 2>/dev/null || true
     done
 
     if [[ "$active$stratum$upstream$allow" == yesyesyesyes ]]; then
-        set_result 6 1 "$title" "chronyd активен, stratum $NTP_STRATUM и доступ клиентам настроены"
+        set_result 6 2 "$title" "chronyd активен, stratum $NTP_STRATUM и доступ клиентам настроены"
     elif ((matched >= 3)); then
-        set_result 6 0.5 "$title" "chronyd работает, одна настройка отличается"
+        set_result 6 1 "$title" "chronyd работает, одна настройка отличается"
     elif [[ "$remote_error" == yes ]]; then
         set_result 6 0 "$title" "SSH на ISP недоступен и HQ-CLI не синхронизирован с $ISP_IP"
     else
@@ -668,9 +668,9 @@ ansible -m ping all 2>&1
     pong_count="$(count_matches "$output" '\"ping\"[[:space:]]*:[[:space:]]*\"pong\"')"
     if ((pong_count >= 4)) &&
         ! grep -Eqi '(FAILED|UNREACHABLE|WARNING)' <<< "$output"; then
-        set_result 7 1 "$title" "Все четыре узла ответили pong"
+        set_result 7 2 "$title" "Все четыре узла ответили pong"
     elif ((pong_count >= 2)); then
-        set_result 7 0.5 "$title" "Ответили pong: $pong_count узла"
+        set_result 7 1 "$title" "Ответили pong: $pong_count узла"
     elif [[ "$remote_error" == yes ]]; then
         set_result 7 0 "$title" "BR-SRV недоступен проверяющему по SSH; ansible ping не выполнен"
     else
@@ -729,11 +729,11 @@ docker exec -e MYSQL_PWD='$APP_DB_PASSWORD' '$DB_CONTAINER' \
     fi
 
     if [[ "$app_running$db_running$mapping_ok$database_ok$database_access$http_ok" == yesyesyesyesyesyes ]]; then
-        set_result 8 1 "$title" "Приложение и БД работают, опубликован порт $APP_PORT"
+        set_result 8 2 "$title" "Приложение и БД работают, опубликован порт $APP_PORT"
     elif [[ "$app_running$db_running$any_mapping$any_http_ok" == yesyesyesyes ]]; then
-        set_result 8 0.5 "$title" "Контейнеры работают, но опубликованный порт отличается"
+        set_result 8 1 "$title" "Контейнеры работают, но опубликованный порт отличается"
     elif [[ "$remote_error" == yes && "$http_ok" == yes ]]; then
-        set_result 8 0.5 "$title" "Приложение отвечает, но BR-SRV недоступен по SSH для проверки контейнеров"
+        set_result 8 1 "$title" "Приложение отвечает, но BR-SRV недоступен по SSH для проверки контейнеров"
     else
         set_result 8 0 "$title" "Работающее контейнерное приложение не обнаружено"
     fi
@@ -771,7 +771,7 @@ MYSQL_PWD='$WEB_DB_PASSWORD' mariadb -u '$WEB_DB_USER' \
         grep -Eq '^USER:[1-9][0-9]*$' <<< "$output" &&
         grep -Eq '^TABLES:[1-9][0-9]*$' <<< "$output" &&
         contains "$output" "DBACCESS:yes"; then
-        set_result 9 1 "$title" "Apache, MariaDB, приложение и база работают"
+        set_result 9 2 "$title" "Apache, MariaDB, приложение и база работают"
     else
         set_result 9 0 "$title" "Полная работоспособность веб-сервиса не подтверждена"
     fi
@@ -812,9 +812,9 @@ check_10_nat() {
     done
 
     if ((rules == 4)); then
-        set_result 10 1 "$title" "Все четыре трансляции подтверждены конфигурацией или подключением"
+        set_result 10 2 "$title" "Все четыре трансляции подтверждены конфигурацией или подключением"
     elif ((rules == 3)); then
-        set_result 10 0.5 "$title" "Не найдено одно правило NAT"
+        set_result 10 1 "$title" "Не найдено одно правило NAT"
     else
         set_result 10 0 "$title" "Найдено правил NAT: $rules из 4"
     fi
@@ -861,14 +861,14 @@ nginx -T 2>&1 || true
 
     if [[ "$web_code" =~ ^(2|3)[0-9][0-9]$ &&
         "$docker_code" =~ ^(2|3)[0-9][0-9]$ ]]; then
-        set_result 11 1 "$title" \
+        set_result 11 2 "$title" \
             "Оба домена работают по $scheme: web=$web_code, docker=$docker_code"
     elif [[ "$web_code" =~ ^(2|3)[0-9][0-9]$ ||
         "$docker_code" =~ ^(2|3)[0-9][0-9]$ ]]; then
-        set_result 11 0.5 "$title" \
+        set_result 11 1 "$title" \
             "$scheme: web=$web_code, docker=$docker_code"
     elif [[ "$active" == yes && "$config_count" -gt 0 ]]; then
-        set_result 11 0.5 "$title" \
+        set_result 11 1 "$title" \
             "Nginx настроен; с HQ-CLI получено: web=$web_code, docker=$docker_code"
     else
         set_result 11 0 "$title" \
@@ -917,7 +917,7 @@ htpasswd -vb /etc/nginx/.htpasswd '$AUTH_USER' '$AUTH_PASSWORD'
     if [[ "$anonymous_code" == 401 &&
         "$authenticated_code" =~ ^(2|3)[0-9][0-9]$ &&
         "$password_ok" == yes ]]; then
-        set_result 12 1 "$title" \
+        set_result 12 2 "$title" \
             "$scheme: без пароля 401, с паролем $authenticated_code"
     else
         set_result 12 0 "$title" \
@@ -932,7 +932,7 @@ check_13_browser() {
         rpm -q yandex-browser-beta >/dev/null 2>&1 ||
         command -v yandex-browser >/dev/null 2>&1 ||
         command -v yandex-browser-stable >/dev/null 2>&1; then
-        set_result 13 1 "$title" "Яндекс Браузер установлен"
+        set_result 13 2 "$title" "Яндекс Браузер установлен"
     else
         set_result 13 0 "$title" "Яндекс Браузер не установлен"
     fi
@@ -1019,8 +1019,8 @@ widths = [
 ]
 
 colors = {
-    "1": os.environ.get("TABLE_C_GREEN", ""),
-    "0.5": os.environ.get("TABLE_C_YELLOW", ""),
+    "2": os.environ.get("TABLE_C_GREEN", ""),
+    "1": os.environ.get("TABLE_C_YELLOW", ""),
     "0": os.environ.get("TABLE_C_RED", ""),
 }
 reset = os.environ.get("TABLE_C_RESET", "")
@@ -1042,12 +1042,8 @@ PY
         column -t -s $'\t' "$table_file"
     fi
 
-    total="$((TOTAL_HALF_POINTS / 2))"
-    if ((TOTAL_HALF_POINTS % 2)); then
-        total="${total}.5"
-    fi
-
-    printf '\n%sИтого: %s / 13 баллов%s\n' "$C_BOLD" "$total" "$C_RESET"
+    total="$TOTAL_POINTS"
+    printf '\n%sИтого: %s / 26 баллов%s\n' "$C_BOLD" "$total" "$C_RESET"
 }
 
 main() {
@@ -1058,8 +1054,8 @@ main() {
         for number in $(seq 1 13); do
             case $((number % 3)) in
                 0) set_result "$number" 0 "Тестовый критерий $number" "Ошибка" ;;
-                1) set_result "$number" 1 "Тестовый критерий $number" "Соответствует" ;;
-                2) set_result "$number" 0.5 "Тестовый критерий $number" "Частично" ;;
+                1) set_result "$number" 2 "Тестовый критерий $number" "Соответствует" ;;
+                2) set_result "$number" 1 "Тестовый критерий $number" "Частично" ;;
             esac
         done
         print_results
